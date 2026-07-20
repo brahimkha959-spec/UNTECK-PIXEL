@@ -1,2 +1,2 @@
-# UNTECK-HELPER
-A website specifically for programmers that helps with several things
+# UNTECK-PIXEL
+A website for creating and exporting videos using only pixel art. 
