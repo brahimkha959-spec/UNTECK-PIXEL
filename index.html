@@ -303,6 +303,470 @@
   <div class="toast" id="toast"></div>
 </div>
 
-<script></script>
+<script>
+  (function(){
+  "use strict";
+
+  /* ---------------- STATE ---------------- */
+  const PALETTE = ["#f2f0ea","#8d8da3","#2b2b45","#0d0d16","#ff4d94","#ff9f5d","#ffe45e","#c6ff3d","#4dffb8","#4dd0ff","#7a7dff","#c37aff","#8a5a3d","#ff5d5d","#5dffd1","transparent"];
+
+  let gridSize = 16;
+  let currentColor = "#f2f0ea";
+  let currentTool = "pencil";
+  let showGrid = true;
+  let onionSkin = false;
+  let fps = 6;
+  let frames = [ newFrame() ];
+  let currentFrameIndex = 0;
+  let history = []; // undo stack for current frame
+  let redoStack = [];
+  let isDrawing = false;
+  let isPlaying = false;
+  let playTimer = null;
+
+  function newFrame(){ return new Array(gridSize*gridSize).fill(null); }
+
+  /* ---------------- DOM ---------------- */
+  const canvas = document.getElementById('pixelCanvas');
+  const ctx = canvas.getContext('2d');
+  const heroCanvas = document.getElementById('heroCanvas');
+  const heroCtx = heroCanvas.getContext('2d');
+  const paletteRow = document.getElementById('paletteRow');
+  const framesStrip = document.getElementById('framesStrip');
+  const toast = document.getElementById('toast');
+
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(()=> toast.classList.remove('show'), 2200);
+  }
+
+  /* ---------------- NAVIGATION ---------------- */
+  const navBtns = document.querySelectorAll('.nav-btn');
+  navBtns.forEach(btn=>{
+    btn.addEventListener('click', ()=> switchPage(btn.dataset.page));
+  });
+  document.getElementById('goEditorBtn').addEventListener('click', ()=> switchPage('page-editor'));
+
+  function switchPage(pageId){
+    document.querySelectorAll('.page').forEach(p=> p.classList.toggle('active', p.id === pageId));
+    navBtns.forEach(b=> b.classList.toggle('active', b.dataset.page === pageId));
+    if(pageId !== 'page-editor') stopPlayback();
+  }
+
+  /* ---------------- CANVAS SIZING ---------------- */
+  function layoutCanvas(){
+    canvas.width = gridSize;
+    canvas.height = gridSize;
+    const stageWidth = Math.min(canvas.parentElement.clientWidth - 36, 380);
+    canvas.style.width = stageWidth + 'px';
+    canvas.style.height = stageWidth + 'px';
+  }
+
+  function drawGridToCtx(targetCtx, gridData, cellSize, opts){
+    opts = opts || {};
+    for(let y=0; y<gridSize; y++){
+      for(let x=0; x<gridSize; x++){
+        const c = gridData[y*gridSize+x];
+        if(c && c !== 'transparent'){
+          targetCtx.globalAlpha = opts.alpha !== undefined ? opts.alpha : 1;
+          targetCtx.fillStyle = c;
+          targetCtx.fillRect(x*cellSize, y*cellSize, cellSize, cellSize);
+          targetCtx.globalAlpha = 1;
+        }
+      }
+    }
+  }
+
+  function render(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    if(onionSkin && currentFrameIndex > 0){
+      drawGridToCtx(ctx, frames[currentFrameIndex-1], 1, {alpha:0.28});
+    }
+    drawGridToCtx(ctx, frames[currentFrameIndex], 1, {});
+    if(showGrid && gridSize <= 32){
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1/ (canvas.clientWidth/gridSize) ;
+      for(let i=1;i<gridSize;i++){
+        ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,gridSize); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(gridSize,i); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    renderThumb(currentFrameIndex);
+  }
+
+  /* ---------------- PALETTE ---------------- */
+  function buildPalette(){
+    paletteRow.innerHTML = '';
+    PALETTE.forEach(color=>{
+      const sw = document.createElement('div');
+      sw.className = 'swatch' + (color === currentColor ? ' active' : '');
+      sw.style.background = color === 'transparent'
+        ? 'repeating-conic-gradient(#444 0% 25%, #222 0% 50%) 50% / 8px 8px'
+        : color;
+      sw.addEventListener('click', ()=>{
+        currentColor = color;
+        buildPalette();
+      });
+      paletteRow.appendChild(sw);
+    });
+    const custom = document.createElement('div');
+    custom.className = 'swatch-custom';
+    custom.textContent = '+';
+    const input = document.createElement('input');
+    input.type = 'color';
+    input.value = currentColor.startsWith('#') ? currentColor : '#ffffff';
+    input.addEventListener('input', (e)=>{ currentColor = e.target.value; buildPalette(); });
+    custom.appendChild(input);
+    paletteRow.appendChild(custom);
+  }
+
+  /* ---------------- TOOLS ---------------- */
+  document.querySelectorAll('.tool-btn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.querySelectorAll('.tool-btn').forEach(b=> b.classList.remove('active'));
+      btn.classList.add('active');
+      currentTool = btn.dataset.tool;
+    });
+  });
+
+  document.getElementById('gridToggle').addEventListener('click', function(){
+    showGrid = !showGrid;
+    this.classList.toggle('on', showGrid);
+    render();
+  });
+  document.getElementById('onionToggle').addEventListener('click', function(){
+    onionSkin = !onionSkin;
+    this.classList.toggle('on', onionSkin);
+    render();
+  });
+  document.getElementById('gridToggle').classList.add('on');
+
+  /* ---------------- DRAWING ---------------- */
+  function cellFromEvent(e){
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const x = Math.floor((clientX - rect.left) / rect.width * gridSize);
+    const y = Math.floor((clientY - rect.top) / rect.height * gridSize);
+    if(x < 0 || y < 0 || x >= gridSize || y >= gridSize) return null;
+    return {x,y};
+  }
+
+  function pushHistory(){
+    history.push(frames[currentFrameIndex].slice());
+    if(history.length > 25) history.shift();
+    redoStack = [];
+  }
+
+  function floodFill(gridData, x, y, targetColor, replacementColor){
+    if(targetColor === replacementColor) return;
+    const stack = [[x,y]];
+    while(stack.length){
+      const [cx,cy] = stack.pop();
+      if(cx<0||cy<0||cx>=gridSize||cy>=gridSize) continue;
+      const idx = cy*gridSize+cx;
+      if(gridData[idx] !== targetColor) continue;
+      gridData[idx] = replacementColor;
+      stack.push([cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]);
+    }
+  }
+
+  function applyToolAt(x,y){
+    const idx = y*gridSize+x;
+    const grid = frames[currentFrameIndex];
+    if(currentTool === 'pencil'){
+      grid[idx] = currentColor === 'transparent' ? null : currentColor;
+    } else if(currentTool === 'eraser'){
+      grid[idx] = null;
+    } else if(currentTool === 'bucket'){
+      floodFill(grid, x, y, grid[idx], currentColor === 'transparent' ? null : currentColor);
+    } else if(currentTool === 'eyedrop'){
+      const picked = grid[idx];
+      if(picked){ currentColor = picked; buildPalette(); }
+      document.querySelector('[data-tool="pencil"]').click();
+      return;
+    }
+    render();
+  }
+
+  function startDraw(e){
+    if(isPlaying) return;
+    e.preventDefault();
+    const cell = cellFromEvent(e);
+    if(!cell) return;
+    isDrawing = true;
+    pushHistory();
+    applyToolAt(cell.x, cell.y);
+  }
+  function moveDraw(e){
+    if(!isDrawing) return;
+    e.preventDefault();
+    const cell = cellFromEvent(e);
+    if(!cell) return;
+    if(currentTool === 'pencil' || currentTool === 'eraser'){
+      applyToolAt(cell.x, cell.y);
+    }
+  }
+  function endDraw(){ isDrawing = false; }
+
+  canvas.addEventListener('pointerdown', startDraw);
+  canvas.addEventListener('pointermove', moveDraw);
+  window.addEventListener('pointerup', endDraw);
+  canvas.addEventListener('touchstart', startDraw, {passive:false});
+  canvas.addEventListener('touchmove', moveDraw, {passive:false});
+  window.addEventListener('touchend', endDraw);
+
+  document.getElementById('undoBtn').addEventListener('click', ()=>{
+    if(!history.length) return;
+    redoStack.push(frames[currentFrameIndex].slice());
+    frames[currentFrameIndex] = history.pop();
+    render();
+  });
+  document.getElementById('redoBtn').addEventListener('click', ()=>{
+    if(!redoStack.length) return;
+    history.push(frames[currentFrameIndex].slice());
+    frames[currentFrameIndex] = redoStack.pop();
+    render();
+  });
+
+  /* ---------------- GRID SIZE ---------------- */
+  const sizeSelect = document.getElementById('sizeSelect');
+  const confirmModal = document.getElementById('confirmModal');
+  let pendingSize = null;
+  sizeSelect.addEventListener('change', ()=>{
+    pendingSize = parseInt(sizeSelect.value, 10);
+    confirmModal.classList.add('show');
+  });
+  document.getElementById('cancelResize').addEventListener('click', ()=>{
+    sizeSelect.value = gridSize;
+    confirmModal.classList.remove('show');
+  });
+  document.getElementById('confirmResize').addEventListener('click', ()=>{
+    gridSize = pendingSize;
+    frames = [ newFrame() ];
+    currentFrameIndex = 0;
+    history = []; redoStack = [];
+    layoutCanvas();
+    renderFramesStrip();
+    render();
+    confirmModal.classList.remove('show');
+  });
+
+  /* ---------------- FRAMES ---------------- */
+  function renderFramesStrip(){
+    framesStrip.innerHTML = '';
+    frames.forEach((frame, i)=>{
+      const thumb = document.createElement('div');
+      thumb.className = 'frame-thumb' + (i === currentFrameIndex ? ' active' : '');
+      const c = document.createElement('canvas');
+      c.width = gridSize; c.height = gridSize;
+      const tctx = c.getContext('2d');
+      drawGridToCtx(tctx, frame, 1, {});
+      thumb.appendChild(c);
+      const num = document.createElement('div');
+      num.className = 'fnum'; num.textContent = i+1;
+      thumb.appendChild(num);
+      if(frames.length > 1){
+        const del = document.createElement('button');
+        del.className = 'frame-del'; del.textContent = '×';
+        del.addEventListener('click', (ev)=>{
+          ev.stopPropagation();
+          frames.splice(i,1);
+          if(currentFrameIndex >= frames.length) currentFrameIndex = frames.length - 1;
+          history = []; redoStack = [];
+          renderFramesStrip(); render();
+        });
+        thumb.appendChild(del);
+      }
+      thumb.addEventListener('click', ()=>{
+        currentFrameIndex = i;
+        history = []; redoStack = [];
+        renderFramesStrip(); render();
+      });
+      framesStrip.appendChild(thumb);
+    });
+    const addBtn = document.createElement('button');
+    addBtn.className = 'frame-add'; addBtn.textContent = '+';
+    addBtn.addEventListener('click', ()=>{
+      frames.push(newFrame());
+      currentFrameIndex = frames.length - 1;
+      history = []; redoStack = [];
+      renderFramesStrip(); render();
+    });
+    framesStrip.appendChild(addBtn);
+
+    document.querySelector('.frames-header .section-title').textContent = 'الإطارات (' + frames.length + ')';
+  }
+
+  function renderThumb(i){
+    const thumbs = framesStrip.querySelectorAll('.frame-thumb');
+    if(!thumbs[i]) return;
+    const c = thumbs[i].querySelector('canvas');
+    const tctx = c.getContext('2d');
+    tctx.clearRect(0,0,c.width,c.height);
+    drawGridToCtx(tctx, frames[i], 1, {});
+  }
+
+  document.getElementById('dupFrameBtn').addEventListener('click', ()=>{
+    frames.splice(currentFrameIndex+1, 0, frames[currentFrameIndex].slice());
+    currentFrameIndex = currentFrameIndex + 1;
+    history = []; redoStack = [];
+    renderFramesStrip(); render();
+    showToast('تم نسخ الإطار');
+  });
+
+  /* ---------------- PLAYBACK ---------------- */
+  const playBtn = document.getElementById('playBtn');
+  const fpsSlider = document.getElementById('fpsSlider');
+  const fpsLabel = document.getElementById('fpsLabel');
+
+  fpsSlider.addEventListener('input', ()=>{
+    fps = parseInt(fpsSlider.value, 10);
+    fpsLabel.textContent = fps + ' fps';
+    if(isPlaying){ stopPlayback(); startPlayback(); }
+  });
+
+  playBtn.addEventListener('click', ()=>{
+    if(isPlaying) stopPlayback(); else startPlayback();
+  });
+
+  function startPlayback(){
+    if(frames.length < 2){ showToast('أضف أكثر من إطار واحد للمعاينة'); return; }
+    isPlaying = true;
+    playBtn.textContent = '❚❚';
+    let i = currentFrameIndex;
+    playTimer = setInterval(()=>{
+      i = (i+1) % frames.length;
+      currentFrameIndex = i;
+      render();
+      document.querySelectorAll('.frame-thumb').forEach((t,idx)=> t.classList.toggle('active', idx===i));
+    }, 1000/fps);
+  }
+  function stopPlayback(){
+    isPlaying = false;
+    playBtn.textContent = '▶';
+    clearInterval(playTimer);
+  }
+
+  /* ---------------- EXPORT PNG ---------------- */
+  document.getElementById('exportPngBtn').addEventListener('click', ()=>{
+    const scale = Math.max(8, Math.floor(320/gridSize));
+    const off = document.createElement('canvas');
+    off.width = gridSize*scale; off.height = gridSize*scale;
+    const octx = off.getContext('2d');
+    octx.imageSmoothingEnabled = false;
+    drawGridToCtx(octx, frames[currentFrameIndex], scale, {});
+    const link = document.createElement('a');
+    link.download = 'pixframe-frame-' + (currentFrameIndex+1) + '.png';
+    link.href = off.toDataURL('image/png');
+    link.click();
+    showToast('تم حفظ الصورة');
+  });
+
+  /* ---------------- EXPORT VIDEO ---------------- */
+  const exportModal = document.getElementById('exportModal');
+  const exportProgress = document.getElementById('exportProgress');
+  const exportResult = document.getElementById('exportResult');
+  const resultVideo = document.getElementById('resultVideo');
+  const downloadVideoBtn = document.getElementById('downloadVideoBtn');
+
+  function sleep(ms){ return new Promise(res=> setTimeout(res, ms)); }
+
+  document.getElementById('exportVideoBtn').addEventListener('click', async ()=>{
+    if(typeof MediaRecorder === 'undefined'){
+      showToast('التصدير غير مدعوم في هذا المتصفح');
+      return;
+    }
+    stopPlayback();
+    exportModal.classList.add('show');
+    exportProgress.style.display = 'block';
+    exportResult.style.display = 'none';
+
+    try{
+      const scale = Math.max(8, Math.min(30, Math.floor(480/gridSize)));
+      const off = document.createElement('canvas');
+      off.width = gridSize*scale; off.height = gridSize*scale;
+      const octx = off.getContext('2d');
+      octx.imageSmoothingEnabled = false;
+
+      const stream = off.captureStream(fps);
+      let mimeType = 'video/webm;codecs=vp9';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
+      const recorder = new MediaRecorder(stream, {mimeType});
+      const chunks = [];
+      recorder.ondataavailable = (e)=>{ if(e.data && e.data.size) chunks.push(e.data); };
+      const stopped = new Promise(res=> recorder.onstop = res);
+
+      recorder.start();
+      const loops = frames.length > 6 ? 2 : 4;
+      const frameDuration = 1000/fps;
+      for(let l=0; l<loops; l++){
+        for(let f=0; f<frames.length; f++){
+          octx.clearRect(0,0,off.width,off.height);
+          drawGridToCtx(octx, frames[f], scale, {});
+          await sleep(frameDuration);
+        }
+      }
+      await sleep(250);
+      recorder.stop();
+      await stopped;
+
+      const blob = new Blob(chunks, {type:'video/webm'});
+      const url = URL.createObjectURL(blob);
+      resultVideo.src = url;
+      downloadVideoBtn.href = url;
+
+      exportProgress.style.display = 'none';
+      exportResult.style.display = 'block';
+    }catch(err){
+      exportModal.classList.remove('show');
+      showToast('حدث خطأ أثناء التصدير');
+    }
+  });
+
+  document.getElementById('closeExportBtn').addEventListener('click', ()=>{
+    exportModal.classList.remove('show');
+    resultVideo.pause();
+  });
+
+  /* ---------------- HERO DEMO ANIMATION ---------------- */
+  function buildHeroFrames(){
+    const g = 16;
+    const mk = ()=> new Array(g*g).fill(null);
+    const body = mk();
+    const paint = (grid, cells, color)=> cells.forEach(([x,y])=> grid[y*g+x] = color);
+    const base = [[6,3],[7,3],[8,3],[9,3],[5,4],[10,4],[5,5],[10,5],[5,6],[6,6],[7,6],[8,6],[9,6],[10,6],[6,7],[9,7],[6,8],[9,8],[5,9],[6,9],[9,9],[10,9],[5,10],[10,10],[5,11],[10,11]];
+    paint(body, base, '#c6ff3d');
+    paint(body, [[7,6],[8,6]], '#0d0d16');
+    const f1 = body.slice();
+    const f2 = body.slice();
+    paint(f2, [[4,11],[11,11]], '#ff4d94');
+    const f3 = body.slice();
+    paint(f3, [[4,4],[11,4]], '#ff4d94');
+    return [f1, f2, f1.slice(), f3];
+  }
+  const heroFrames = buildHeroFrames();
+  let heroIdx = 0;
+  function tickHero(){
+    heroCtx.clearRect(0,0,16,16);
+    drawGridToCtx(heroCtx, heroFrames[heroIdx], 1, {});
+    heroIdx = (heroIdx+1) % heroFrames.length;
+  }
+  tickHero();
+  setInterval(tickHero, 260);
+
+  /* ---------------- INIT ---------------- */
+  window.addEventListener('resize', layoutCanvas);
+  buildPalette();
+  layoutCanvas();
+  renderFramesStrip();
+  render();
+
+})();
+</script>
 </body>
 </html>
